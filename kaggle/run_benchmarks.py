@@ -158,7 +158,7 @@ def verify_dual_gpu_training():
         mamba_headdim=16,
     )
     model = HybridCausalLM(config)
-    parallel = nn.DataParallel(model, device_ids=[0, 1]).cuda(0)
+    parallel = nn.DataParallel(_LossAndLogits(model), device_ids=[0, 1]).cuda(0)
     optimizer = torch.optim.AdamW(parallel.parameters(), lr=1e-3)
     input_ids = torch.randint(0, config.vocab_size, (8, 32), device="cuda:0")
     labels = input_ids.clone()
