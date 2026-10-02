@@ -235,8 +235,14 @@ def verify_cli_training():
             "--device", "cuda:0", "--gpu-ids", "0,1", "--precision", "fp16",
         ]
         completed = subprocess.run(
-            command, cwd=repo, check=True, capture_output=True, text=True, timeout=600
+            command, cwd=repo, capture_output=True, text=True, timeout=600
         )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                "APEX CLI training failed.\n"
+                f"stdout:\n{completed.stdout}\n"
+                f"stderr:\n{completed.stderr}"
+            )
         model_file = output / "latest.apex"
         checkpoint_file = output / "training_state.pt"
         tokenizer_file = output / "tokenizer.json"
