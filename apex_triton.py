@@ -170,12 +170,13 @@ class _MambaScan(torch.autograd.Function):
             (batch, steps, heads, width, state_size), device=u.device, dtype=u.dtype
         )
         bx_states = torch.empty_like(states)
-        _mamba_scan_forward[(batch * heads,)](
-            u, b, c, dt, trap, a, y, states, bx_states,
-            steps, heads, width, state_size,
-            triton.next_power_of_2(width), triton.next_power_of_2(state_size),
-            num_warps=4,
-        )
+        with torch.cuda.device(u.device):
+            _mamba_scan_forward[(batch * heads,)](
+                u, b, c, dt, trap, a, y, states, bx_states,
+                steps, heads, width, state_size,
+                triton.next_power_of_2(width), triton.next_power_of_2(state_size),
+                num_warps=4,
+            )
         ctx.save_for_backward(u, b, c, dt, trap, a, states, bx_states)
         ctx.shape = (batch, steps, heads, width, state_size)
         return y
@@ -188,13 +189,14 @@ class _MambaScan(torch.autograd.Function):
             torch.empty_like(u), torch.empty_like(b), torch.empty_like(c),
             torch.empty_like(dt), torch.empty_like(trap), torch.zeros_like(a),
         ]
-        _mamba_scan_backward[(batch * heads,)](
-            u, b, c, dt, trap, a, grad_y.contiguous(), states, bx_states,
-            *grads,
-            steps, heads, width, state_size,
-            triton.next_power_of_2(width), triton.next_power_of_2(state_size),
-            num_warps=4,
-        )
+        with torch.cuda.device(u.device):
+            _mamba_scan_backward[(batch * heads,)](
+                u, b, c, dt, trap, a, grad_y.contiguous(), states, bx_states,
+                *grads,
+                steps, heads, width, state_size,
+                triton.next_power_of_2(width), triton.next_power_of_2(state_size),
+                num_warps=4,
+            )
         return tuple(grads)
 
 
@@ -212,6 +214,18 @@ def mamba3_scan(
         raise RuntimeError("mamba3_scan requires Triton and CUDA tensors")
     if any(not tensor.is_contiguous() for tensor in tensors):
         raise ValueError("mamba3_scan inputs must be contiguous")
+    if any(tensor.device != u.device for tensor in tensors):
+        raise ValueError("mamba3_scan inputs must be on the same CUDA device")
+    batch, steps, heads, width = u.shape
+    state_size = b.shape[-1] if b.ndim == 4 else -1
+    if (
+        b.shape != (batch, steps, heads, state_size)
+        or c.shape != b.shape
+        or dt.shape != (batch, steps, heads)
+        or trap.shape != dt.shape
+        or a.shape != (heads,)
+    ):
+        raise ValueError("mamba3_scan received incompatible tensor shapes")
     return _MambaScan.apply(*tensors)
 
 
@@ -228,13 +242,29 @@ def mamba3_decode_step(
     """Fuse one Mamba-3 state update and readout; returns None without Triton/CUDA."""
     if not TRITON_AVAILABLE or not u.is_cuda:
         return None
+    tensors = (u, b, c, dt, trap, a, h_state, bx_prev)
+    if any(tensor.device != u.device for tensor in tensors):
+        raise ValueError("mamba3_decode_step inputs must be on the same CUDA device")
+    if any(not tensor.is_contiguous() for tensor in tensors):
+        raise ValueError("mamba3_decode_step inputs must be contiguous")
     batch, heads, width = u.shape
     state_size = b.shape[-1]
+    if (
+        b.shape != (batch, heads, state_size)
+        or c.shape != b.shape
+        or dt.shape != (batch, heads)
+        or trap.shape != dt.shape
+        or a.shape != (heads,)
+        or h_state.shape != (batch, heads, width, state_size)
+        or bx_prev.shape != h_state.shape
+    ):
+        raise ValueError("mamba3_decode_step received incompatible tensor shapes")
     y = torch.empty_like(u)
-    _mamba_decode_step[(batch * heads,)](
-        u, b, c, dt, trap, a, h_state, bx_prev, y,
-        heads, width, state_size,
-        triton.next_power_of_2(width), triton.next_power_of_2(state_size),
-        num_warps=4,
-    )
+    with torch.cuda.device(u.device):
+        _mamba_decode_step[(batch * heads,)](
+            u, b, c, dt, trap, a, h_state, bx_prev, y,
+            heads, width, state_size,
+            triton.next_power_of_2(width), triton.next_power_of_2(state_size),
+            num_warps=4,
+        )
     return y
