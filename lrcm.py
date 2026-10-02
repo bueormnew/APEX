@@ -156,7 +156,7 @@ class LRCM(nn.Module):
         positions = torch.arange(T, device=q.device)
         offsets = torch.arange(window, device=q.device)
         valid_keys = positions[:, None] - window + 1 + offsets[None, :] >= 0
-        scores = scores.masked_fill(~valid_keys[None, None], -1e30)
+        scores = scores.masked_fill(~valid_keys[None, None], torch.finfo(scores.dtype).min)
         attn = F.softmax(scores, dim=-1)
         out = torch.matmul(attn.unsqueeze(-2), v_windows).squeeze(-2)
         out = out.transpose(1, 2).contiguous().view(B, T, H * D)
@@ -248,7 +248,9 @@ class LRCM(nn.Module):
         
         # Solo se recuperan chunks completos anteriores al chunk consultado.
         chunk_causal_mask = token_chunk_id.unsqueeze(1) > torch.arange(n_chunks, device=x.device).unsqueeze(0) # [T, n_chunks]
-        scores_chunk = scores_chunk.masked_fill(~chunk_causal_mask.unsqueeze(0), -1e30)
+        scores_chunk = scores_chunk.masked_fill(
+            ~chunk_causal_mask.unsqueeze(0), torch.finfo(scores_chunk.dtype).min
+        )
 
         # Seleccionar top-B chunks
         beam_k = min(self.beam_size, n_chunks)
@@ -275,7 +277,9 @@ class LRCM(nn.Module):
         # q_recall: [B, T, 1, D]
         attn_scores = torch.matmul(q_recall.unsqueeze(2), gathered_k.transpose(-1, -2)) / math.sqrt(D) # [B, T, 1, beam_k * chunk_size]
         attn_scores = attn_scores.view(B, T, beam_k, self.chunk_size)
-        attn_scores = attn_scores.masked_fill(~selected_valid.unsqueeze(-1), -1e30)
+        attn_scores = attn_scores.masked_fill(
+            ~selected_valid.unsqueeze(-1), torch.finfo(attn_scores.dtype).min
+        )
         attn_scores = attn_scores.view(B, T, 1, beam_k * self.chunk_size)
         leaf_weights = F.softmax(attn_scores, dim=-1)
         h_recall = torch.matmul(leaf_weights, gathered_v).squeeze(2) # [B, T, D]

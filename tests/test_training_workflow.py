@@ -4,6 +4,8 @@ from torch.utils.data import DataLoader
 from apex_core import APEXConfig, APEXModel, APEXTrainer, TrainingConfig
 from apex_core.data import ByteTokenizer, RandomTextWindowDataset
 from hybrid_model import HybridCausalLM, HybridLMConfig
+from hopmix import HopMix
+from lrcm import LRCM
 
 
 def test_byte_tokenizer_round_trip_and_shifted_windows(tmp_path):
@@ -56,6 +58,21 @@ def test_apex_full_sequence_matches_cached_generation_and_is_causal():
         altered[:, 12] = (altered[:, 12] + 1) % config.vocab_size
         altered_logits = model(altered)["logits"]
         torch.testing.assert_close(altered_logits[:, :12], logits[:, :12], atol=1e-5, rtol=1e-5)
+
+
+def test_hopmix_and_lrcm_masks_support_fp16():
+    torch.manual_seed(5)
+    inputs = torch.randn(2, 8, 16, dtype=torch.float16)
+    lrcm = LRCM(
+        16, n_heads=4, local_window=4, chunk_size=4,
+        page_chunks=2, region_pages=2, desc_dim=8, beam_size=1,
+    ).half()
+    hopmix = HopMix(16, max_seq_len=8, n_gate_heads=4).half()
+
+    lrcm_output, _ = lrcm(inputs)
+    hopmix_output = hopmix(inputs)
+    assert torch.isfinite(lrcm_output).all()
+    assert torch.isfinite(hopmix_output).all()
 
 
 def test_trainer_saves_resumable_checkpoint_and_inference_model(tmp_path):

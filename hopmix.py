@@ -246,9 +246,11 @@ class HopMix(nn.Module):
                     w = torch.clamp(route_w[:, :, g_i], min=1e-8)
                     gate_logits[:, :, :, slot_idx] += (self.beta_routes[g_i] * torch.log(w)).unsqueeze(-1)
 
-        # Enmascarar ranuras no válidas con valor finito grande (-1e30) para evitar NaNs
+        # Enmascarar ranuras no válidas con el mínimo representable del dtype.
         mask_val = all_val.unsqueeze(2).expand(-1, -1, self.H, -1) # [B, T, H, S]
-        gate_logits = torch.where(mask_val, gate_logits, torch.tensor(-1e30, device=device, dtype=gate_logits.dtype))
+        gate_logits = torch.where(
+            mask_val, gate_logits, torch.tensor(torch.finfo(gate_logits.dtype).min, device=device, dtype=gate_logits.dtype)
+        )
 
         # Softmax con el sumidero nulo nu_h incorporado
         # Cat nu_h como la ranura S+1: [B, T, H, S + 1]
@@ -343,7 +345,7 @@ class HopMix(nn.Module):
 
         for s_idx, (src, val) in enumerate(zip(src_indices, valid_masks)):
             if not val:
-                gate_logits[:, :, :, s_idx] = -1e30
+                gate_logits[:, :, :, s_idx] = torch.finfo(gate_logits.dtype).min
             else:
                 if self.use_salience:
                     gate_logits[:, :, :, s_idx] += cache.z[:, src : src + 1, :]
