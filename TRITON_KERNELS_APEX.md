@@ -41,6 +41,18 @@ kaggle kernels output gersonbuenahora/apex-two-t4-triton-benchmarks -p kaggle-ou
 
 El notebook confirma cantidad/modelo de GPU y version de Triton, compara forward y backward del scan con una referencia PyTorch, compara el decode y la mutacion de estado, ejecuta un paso de entrenamiento del modelo HOP-MIX + LRCM + Mamba-3 con `DataParallel` en las dos GPU, genera tokens en ambas y mide el scan de entrenamiento y el paso de decode por GPU. Produce `apex_triton_benchmark.json` con las formas, tiempos y cocientes medidos; no contiene cifras supuestas. Los resultados dependen del runtime y de las formas probadas y no equivalen a un benchmark de un LLM grande.
 
+### Resultado guardado de Kaggle
+
+La ejecucion completada del 2026-10-02 (notebook version 4, commit `9bb27f0`, PyTorch 2.11.0+cu128, Triton 3.6.0) produjo [`kaggle/results/apex_triton_benchmark.json`](kaggle/results/apex_triton_benchmark.json):
+
+| Medicion | PyTorch | Triton | Cociente |
+|---|---:|---:|---:|
+| Scan de entrenamiento forward + backward, `(B,T,H,P,N)=(4,96,4,32,32)` | 92.340 ms | 0.964 ms | 95.746x |
+| Decode, batch 16, GPU 0 | 0.2386 ms | 0.0689 ms | 3.461x |
+| Decode, batch 16, GPU 1 | 0.2460 ms | 0.0632 ms | 3.893x |
+
+Son microbenchmarks del nucleo recurrente frente a la implementacion PyTorch de referencia; **no** son speedups de entrenamiento o generacion del modelo completo. El mismo run verifico cuatro pruebas Triton (forward/backward y decode en las dos T4), una actualizacion de entrenamiento hibrido DataParallel con logits `[8,32,128]`, memoria reservada en ambas tarjetas y generacion de forma `[1,7]` en cada una.
+
 Prueba local de la suite:
 
 ```bash

@@ -1,0 +1,74 @@
+{
+  "run": {
+    "date_utc": "2026-10-02",
+    "kaggle_kernel": "https://www.kaggle.com/code/gersonbuenahora/apex-two-t4-triton-benchmarks",
+    "kaggle_version": 4,
+    "repository_commit": "9bb27f0",
+    "gpus": [
+      "Tesla T4",
+      "Tesla T4"
+    ]
+  },
+  "torch": "2.11.0+cu128",
+  "triton": "3.6.0",
+  "training_scan_gpu0": {
+    "shape": [
+      4,
+      96,
+      4,
+      32,
+      32
+    ],
+    "torch_forward_backward_ms": 92.34,
+    "triton_forward_backward_ms": 0.964,
+    "speedup": 95.746
+  },
+  "decode_step_per_gpu": {
+    "0": {
+      "batch": 16,
+      "torch_step_ms": 0.2386,
+      "triton_step_ms": 0.0689,
+      "speedup": 3.461
+    },
+    "1": {
+      "batch": 16,
+      "torch_step_ms": 0.246,
+      "triton_step_ms": 0.0632,
+      "speedup": 3.893
+    }
+  },
+  "hybrid_data_parallel_training": {
+    "devices": [
+      "Tesla T4",
+      "Tesla T4"
+    ],
+    "batch": [
+      8,
+      32
+    ],
+    "logits": [
+      8,
+      32,
+      128
+    ],
+    "loss": 31.322165,
+    "gpu0_reserved_mb": 80.0,
+    "gpu1_reserved_mb": 26.0
+  },
+  "autoregressive_generation_per_gpu": [
+    {
+      "device": "Tesla T4",
+      "generated_shape": [
+        1,
+        7
+      ]
+    },
+    {
+      "device": "Tesla T4",
+      "generated_shape": [
+        1,
+        7
+      ]
+    }
+  ]
+}

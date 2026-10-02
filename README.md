@@ -165,6 +165,8 @@ kaggle kernels status gersonbuenahora/apex-two-t4-triton-benchmarks
 
 El notebook exige dos T4, comprueba salidas y gradientes contra PyTorch, entrena el modelo híbrido con DataParallel en ambas GPU, y prueba generación en cada GPU. Las métricas se miden en el runtime y dependen de sus formas de tensores; no se asume una aceleración por adelantado. Consulta [`TRITON_KERNELS_APEX.md`](TRITON_KERNELS_APEX.md) para detalles y limitaciones.
 
+La ejecución completada está en [Kaggle](https://www.kaggle.com/code/gersonbuenahora/apex-two-t4-triton-benchmarks); sus métricas observadas, limitadas a los microbenchmarks recurrentes y no al modelo completo, se guardan en [`kaggle/results/apex_triton_benchmark.json`](kaggle/results/apex_triton_benchmark.json).
+
 ---
 
 ## 📂 Estructura del Repositorio
