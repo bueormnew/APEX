@@ -40,6 +40,28 @@ Requisitos: `torch>=2.0.0`, `einops>=0.7.0`.
 
 ---
 
+## 🧪 Entrenar un modelo híbrido con tu corpus
+
+Instala APEX y usa `apex train` sobre un archivo UTF-8 o un directorio con archivos `.txt`, `.md`, `.csv`, `.json`, `.html` o `.log`. El preset por defecto mezcla **HOP-MIX, LRCM, Mamba-3 y ECHO**; por defecto usa todas las GPU CUDA visibles, precisión automática, validación, checkpoint reanudable y un tokenizador byte UTF-8 incluido (no requiere descargar un tokenizer externo):
+
+```bash
+python -m pip install -e .
+apex train --data ./mi_corpus --output ./runs/mi_apex --steps 1000 --batch-size 2 --sequence-length 128 --max-seq-len 512 --gpu-ids 0,1
+```
+
+En Windows también puedes usar `python apex_cli.py train ...` si el comando `apex` aún no aparece en `PATH`. Si no indicas validación separada, el CLI reserva el 10% final del texto para validación. Adapta `d-model`, secuencia, lote y pasos a la VRAM disponible; el tokenizador byte es un camino reproducible para empezar, pero consume más tokens por texto que un tokenizer subword y **el CLI no entrega un modelo preentrenado**: la capacidad y calidad dependen de tus datos y del entrenamiento.
+
+El directorio de salida contiene `latest.apex` (modelo listo para carga), `best.apex` (mejor validación cuando se evalúa durante el entrenamiento), `tokenizer.json`, `metrics.json` y `training_state.pt` (pesos, optimizador, scheduler y estados aleatorios para reanudar). Para continuar más allá del objetivo original, conserva los hiperparámetros y sube `--steps` al nuevo total:
+
+```bash
+apex train --data ./mi_corpus --output ./runs/mi_apex --steps 2000 --batch-size 2 --sequence-length 128 --max-seq-len 512 --gpu-ids 0,1 --resume
+apex generate --model ./runs/mi_apex/latest.apex --prompt "Érase una vez" --max-new-tokens 100
+```
+
+Para un smoke test corto, prueba `--layers hopmix,lrcm,mamba3 --d-model 64 --head-dim 16 --state-size 16 --steps 5`; para arquitectura y capacidad de producción, configura el preset y escala la secuencia, los datos y los pasos de acuerdo con las GPU. El entrenamiento multi-GPU de este CLI replica el modelo con `DataParallel`; el batch debe ser al menos igual al número de GPU.
+
+---
+
 ## 🛠️ Guía Rápida de Uso
 
 ### 1. Crear un Modelo con un Preset

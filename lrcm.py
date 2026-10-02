@@ -33,6 +33,7 @@ class LRCMMemoryState:
         self,
         batch_size: int,
         max_tokens: int,
+        local_window: int = 16,
         chunk_size: int = 16,
         page_size: int = 64,
         region_size: int = 256,
@@ -42,14 +43,20 @@ class LRCMMemoryState:
         dtype: torch.dtype = torch.float32,
     ):
         self.chunk_size = chunk_size
+        self.local_window = local_window
+        self.max_tokens = max_tokens
         self.page_size = page_size
         self.region_size = region_size
-        self.max_chunks = max(1, max_tokens // chunk_size)
-        self.max_pages = max(1, max_tokens // page_size)
-        self.max_regions = max(1, max_tokens // region_size)
+        self.max_chunks = max(1, math.ceil(max_tokens / chunk_size))
+        self.max_pages = max(1, math.ceil(max_tokens / page_size))
+        self.max_regions = max(1, math.ceil(max_tokens / region_size))
 
         self.leaf_kv = torch.zeros(batch_size, self.max_chunks, chunk_size, 2, d_model, device=device, dtype=dtype)
         self.chunk_desc = torch.zeros(batch_size, self.max_chunks, desc_dim, device=device, dtype=dtype)
+        self.chunk_pool = torch.zeros_like(self.chunk_desc)
+        self.chunk_desc_accumulator = torch.zeros(batch_size, desc_dim, device=device, dtype=dtype)
+        self.local_k = torch.zeros(batch_size, local_window, d_model, device=device, dtype=dtype)
+        self.local_v = torch.zeros_like(self.local_k)
         self.page_desc = torch.zeros(batch_size, self.max_pages, desc_dim, device=device, dtype=dtype)
         self.region_desc = torch.zeros(batch_size, self.max_regions, desc_dim, device=device, dtype=dtype)
 
@@ -138,18 +145,20 @@ class LRCM(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        # Matriz de similitud causal local
-        scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(D) # [B, H, T, T]
-        
-        # Máscara causal con ventana W
-        pos = torch.arange(T, device=q.device)
-        causal_mask = pos.unsqueeze(1) >= pos.unsqueeze(0) # [T, T]
-        window_mask = (pos.unsqueeze(1) - pos.unsqueeze(0)) < self.local_window
-        mask = causal_mask & window_mask
+        window = min(self.local_window, T)
+        k_windows = F.pad(k, (0, 0, window - 1, 0)).unfold(2, window, 1)
+        v_windows = F.pad(v, (0, 0, window - 1, 0)).unfold(2, window, 1)
+        k_windows = k_windows.permute(0, 1, 2, 4, 3)
+        v_windows = v_windows.permute(0, 1, 2, 4, 3)
 
-        scores = scores.masked_fill(~mask.unsqueeze(0).unsqueeze(0), -1e30)
+        scores = torch.matmul(q.unsqueeze(-2), k_windows.transpose(-1, -2)).squeeze(-2)
+        scores = scores / math.sqrt(D)
+        positions = torch.arange(T, device=q.device)
+        offsets = torch.arange(window, device=q.device)
+        valid_keys = positions[:, None] - window + 1 + offsets[None, :] >= 0
+        scores = scores.masked_fill(~valid_keys[None, None], -1e30)
         attn = F.softmax(scores, dim=-1)
-        out = torch.matmul(attn, v) # [B, H, T, D]
+        out = torch.matmul(attn.unsqueeze(-2), v_windows).squeeze(-2)
         out = out.transpose(1, 2).contiguous().view(B, T, H * D)
         return self.out_local(out)
 
@@ -237,13 +246,16 @@ class LRCM(nn.Module):
         # Scores sobre todos los chunks: [B, T, n_chunks]
         scores_chunk = torch.matmul(q_mem, chunk_desc.transpose(1, 2)) / (math.sqrt(self.desc_dim) * self.temperature)
         
-        # Máscara causal de chunks (no mirar chunks futuros)
-        chunk_causal_mask = token_chunk_id.unsqueeze(1) >= torch.arange(n_chunks, device=x.device).unsqueeze(0) # [T, n_chunks]
+        # Solo se recuperan chunks completos anteriores al chunk consultado.
+        chunk_causal_mask = token_chunk_id.unsqueeze(1) > torch.arange(n_chunks, device=x.device).unsqueeze(0) # [T, n_chunks]
         scores_chunk = scores_chunk.masked_fill(~chunk_causal_mask.unsqueeze(0), -1e30)
 
         # Seleccionar top-B chunks
         beam_k = min(self.beam_size, n_chunks)
         top_scores, top_chunk_indices = torch.topk(scores_chunk, beam_k, dim=-1) # [B, T, beam_k]
+        selected_valid = chunk_causal_mask.unsqueeze(0).expand(B, -1, -1).gather(
+            2, top_chunk_indices
+        )
 
         # 5. Exact Leaf Gather y Tiny Exact Attention
         # Gather de los chunks seleccionados:
@@ -262,12 +274,17 @@ class LRCM(nn.Module):
         # Exact Attention sobre las hojas recuperadas
         # q_recall: [B, T, 1, D]
         attn_scores = torch.matmul(q_recall.unsqueeze(2), gathered_k.transpose(-1, -2)) / math.sqrt(D) # [B, T, 1, beam_k * chunk_size]
+        attn_scores = attn_scores.view(B, T, beam_k, self.chunk_size)
+        attn_scores = attn_scores.masked_fill(~selected_valid.unsqueeze(-1), -1e30)
+        attn_scores = attn_scores.view(B, T, 1, beam_k * self.chunk_size)
         leaf_weights = F.softmax(attn_scores, dim=-1)
         h_recall = torch.matmul(leaf_weights, gathered_v).squeeze(2) # [B, T, D]
 
         # 6. Fusión con compuerta aprendida
         fusion_logits = self.fusion_gate(q_combo) # [B, T, 2]
         g = F.softmax(fusion_logits, dim=-1)
+        has_memory = (token_chunk_id > 0).view(1, T, 1)
+        g = torch.where(has_memory, g, torch.cat([torch.ones_like(g[..., :1]), torch.zeros_like(g[..., 1:])], dim=-1))
         h_fused = g[:, :, 0:1] * h_local + g[:, :, 1:2] * h_recall
 
         out = x + self.out_proj(h_fused)
@@ -285,47 +302,73 @@ class LRCM(nn.Module):
         B, _, D = x_t.shape
         x_norm = self.norm(x_t)
 
-        # Local attention
+        if state.num_tokens >= state.max_tokens:
+            raise ValueError("LRCM inference state exceeded its configured max_tokens")
+
+        # Cache local keys/values and compute causal sliding-window attention.
         q_l = self.q_local(x_norm).view(B, 1, self.n_heads, self.head_dim)
         k_l = self.k_local(x_norm).view(B, 1, self.n_heads, self.head_dim)
         v_l = self.v_local(x_norm).view(B, 1, self.n_heads, self.head_dim)
-        h_local = self.out_local(q_l.view(B, 1, D)) # simplificado en step
+        position = state.num_tokens
+        state.local_k[:, position % self.local_window] = k_l[:, 0].reshape(B, D)
+        state.local_v[:, position % self.local_window] = v_l[:, 0].reshape(B, D)
+        local_len = min(position + 1, self.local_window)
+        local_positions = torch.arange(
+            position + 1 - local_len, position + 1, device=x_t.device
+        ) % self.local_window
+        k_window = state.local_k.index_select(1, local_positions).view(
+            B, local_len, self.n_heads, self.head_dim
+        ).transpose(1, 2)
+        v_window = state.local_v.index_select(1, local_positions).view(
+            B, local_len, self.n_heads, self.head_dim
+        ).transpose(1, 2)
+        q_window = q_l.transpose(1, 2)
+        local_scores = torch.matmul(q_window, k_window.transpose(-1, -2)) / math.sqrt(self.head_dim)
+        local_weights = F.softmax(local_scores, dim=-1)
+        local_context = torch.matmul(local_weights, v_window).transpose(1, 2).contiguous().view(B, 1, D)
+        h_local = self.out_local(local_context)
 
-        # Si aún no hay chunks completos en memoria
-        if state.num_chunks == 0:
+        q_combo = torch.cat([x_norm, h_local], dim=-1)
+        available_chunks = state.num_chunks
+        if available_chunks == 0:
             out = x_t + self.out_proj(h_local)
+            state.chunk_desc_accumulator.add_(self.token_to_desc(x_norm[:, 0]))
+            state.leaf_kv[:, position // self.chunk_size, position % self.chunk_size, 0] = self.k_leaf_proj(x_norm)[:, 0]
+            state.leaf_kv[:, position // self.chunk_size, position % self.chunk_size, 1] = self.v_leaf_proj(x_norm)[:, 0]
+            if (position + 1) % self.chunk_size == 0:
+                chunk_index = position // self.chunk_size
+                state.chunk_pool[:, chunk_index] = state.chunk_desc_accumulator / self.chunk_size
+                first = max(0, chunk_index - self.conv_chunk.kernel_size + 1)
+                recent = state.chunk_pool[:, first : chunk_index + 1].transpose(1, 2)
+                state.chunk_desc[:, chunk_index] = self.conv_chunk(recent)[:, :, -1]
+                state.chunk_desc_accumulator.zero_()
+                state.num_chunks += 1
             state.num_tokens += 1
             return out, state
 
         # Query de memoria
-        q_combo = torch.cat([x_norm, h_local], dim=-1)
         q_mem = self.q_mem_proj(q_combo) # [B, 1, desc_dim]
         q_recall = self.q_recall_proj(q_combo) # [B, 1, D]
 
         # Scoring de chunks disponibles
-        avail_chunks = state.num_chunks
-        chunk_desc_avail = state.chunk_desc[:, :avail_chunks] # [B, avail_chunks, desc_dim]
+        chunk_desc_avail = state.chunk_desc[:, :available_chunks] # [B, avail_chunks, desc_dim]
         scores = torch.matmul(q_mem, chunk_desc_avail.transpose(1, 2)) / (math.sqrt(self.desc_dim) * self.temperature)
 
-        beam_k = min(self.beam_size, avail_chunks)
+        beam_k = min(self.beam_size, available_chunks)
         _, top_idx = torch.topk(scores, beam_k, dim=-1) # [B, 1, beam_k]
+        leaf_k = state.leaf_kv[:, :, :, 0, :]
+        leaf_v = state.leaf_kv[:, :, :, 1, :]
+        index = top_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, self.chunk_size, D)
+        gathered_k = torch.gather(
+            leaf_k.unsqueeze(1).expand(-1, 1, -1, -1, -1), 2, index
+        ).reshape(B, 1, beam_k * self.chunk_size, D)
+        gathered_v = torch.gather(
+            leaf_v.unsqueeze(1).expand(-1, 1, -1, -1, -1), 2, index
+        ).reshape(B, 1, beam_k * self.chunk_size, D)
 
-        # Gather de hojas exactas
-        gathered_k = []
-        gathered_v = []
-        for b in range(B):
-            b_indices = top_idx[b, 0] # [beam_k]
-            k_sel = state.leaf_kv[b, b_indices, :, 0, :] # [beam_k, chunk_size, D]
-            v_sel = state.leaf_kv[b, b_indices, :, 1, :]
-            gathered_k.append(k_sel.reshape(1, beam_k * self.chunk_size, D))
-            gathered_v.append(v_sel.reshape(1, beam_k * self.chunk_size, D))
-
-        gathered_k = torch.cat(gathered_k, dim=0) # [B, beam_k * chunk_size, D]
-        gathered_v = torch.cat(gathered_v, dim=0)
-
-        attn_scores = torch.matmul(q_recall, gathered_k.transpose(-1, -2)) / math.sqrt(D)
+        attn_scores = torch.matmul(q_recall.unsqueeze(2), gathered_k.transpose(-1, -2)) / math.sqrt(D)
         leaf_weights = F.softmax(attn_scores, dim=-1)
-        h_recall = torch.matmul(leaf_weights, gathered_v) # [B, 1, D]
+        h_recall = torch.matmul(leaf_weights, gathered_v).squeeze(2) # [B, 1, D]
 
         # Fusión
         fusion_logits = self.fusion_gate(q_combo)
@@ -333,6 +376,19 @@ class LRCM(nn.Module):
         h_fused = g[:, :, 0:1] * h_local + g[:, :, 1:2] * h_recall
 
         out = x_t + self.out_proj(h_fused)
+        # Commit current token to the leaf store after retrieval to keep reads strictly causal.
+        chunk_index = position // self.chunk_size
+        chunk_offset = position % self.chunk_size
+        state.leaf_kv[:, chunk_index, chunk_offset, 0] = self.k_leaf_proj(x_norm)[:, 0]
+        state.leaf_kv[:, chunk_index, chunk_offset, 1] = self.v_leaf_proj(x_norm)[:, 0]
+        state.chunk_desc_accumulator.add_(self.token_to_desc(x_norm[:, 0]))
+        if chunk_offset + 1 == self.chunk_size:
+            state.chunk_pool[:, chunk_index] = state.chunk_desc_accumulator / self.chunk_size
+            first = max(0, chunk_index - self.conv_chunk.kernel_size + 1)
+            recent = state.chunk_pool[:, first : chunk_index + 1].transpose(1, 2)
+            state.chunk_desc[:, chunk_index] = self.conv_chunk(recent)[:, :, -1]
+            state.chunk_desc_accumulator.zero_()
+            state.num_chunks += 1
         state.num_tokens += 1
         return out, state
 

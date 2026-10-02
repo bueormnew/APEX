@@ -2,7 +2,9 @@
 
 import json
 import statistics
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -207,6 +209,60 @@ def verify_dual_gpu_generation():
     return results
 
 
+def verify_cli_training():
+    repo = Path(__file__).resolve().parents[1]
+    with tempfile.TemporaryDirectory(prefix="apex-cli-") as temporary:
+        workspace = Path(temporary)
+        corpus = workspace / "corpus.txt"
+        corpus.write_text(
+            ("APEX combina HOP-MIX, LRCM, Mamba-3 y ECHO. "
+             "Los modelos predicen el siguiente byte del texto.\\n") * 40,
+            encoding="utf-8",
+        )
+        output = workspace / "run"
+        command = [
+            sys.executable, str(repo / "apex_cli.py"), "train",
+            "--data", str(corpus), "--output", str(output),
+            "--steps", "2", "--batch-size", "4",
+            "--sequence-length", "16", "--max-seq-len", "32",
+            "--d-model", "32", "--layers", "hopmix,lrcm,mamba3",
+            "--echo-keys", "8", "--echo-top-k", "2", "--echo-rank", "4",
+            "--lrcm-heads", "4", "--local-window", "8",
+            "--chunk-size", "4", "--descriptor-dim", "8", "--memory-beam", "1",
+            "--state-size", "16", "--head-dim", "16",
+            "--eval-interval", "1", "--eval-batches", "1",
+            "--save-interval", "1", "--log-interval", "1",
+            "--device", "cuda:0", "--gpu-ids", "0,1", "--precision", "fp16",
+        ]
+        completed = subprocess.run(
+            command, cwd=repo, check=True, capture_output=True, text=True, timeout=600
+        )
+        model_file = output / "latest.apex"
+        checkpoint_file = output / "training_state.pt"
+        tokenizer_file = output / "tokenizer.json"
+        metrics_file = output / "metrics.json"
+        assert all(path.is_file() for path in (model_file, checkpoint_file, tokenizer_file, metrics_file))
+        metrics = json.loads(metrics_file.read_text(encoding="utf-8"))
+        assert metrics["last_step"] == 2 and metrics["final_validation"]["val_loss"] > 0
+
+        generated = subprocess.run(
+            [
+                sys.executable, str(repo / "apex_cli.py"), "generate",
+                "--model", str(model_file), "--prompt", "APEX",
+                "--max-new-tokens", "4", "--temperature", "0", "--device", "cuda:0",
+            ],
+            cwd=repo, check=True, capture_output=True, text=True, timeout=300,
+        )
+        return {
+            "completed_training_steps": metrics["last_step"],
+            "validation_loss": round(metrics["final_validation"]["val_loss"], 6),
+            "model_exported": model_file.is_file(),
+            "resume_checkpoint_exported": checkpoint_file.is_file(),
+            "generation_command_succeeded": generated.returncode == 0,
+            "training_output_contains_two_t4_data_parallel": "GPUs: [0, 1]" in completed.stdout,
+        }
+
+
 def main():
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
         raise RuntimeError("This benchmark requires Kaggle's dual-T4 GPU machine.")
@@ -223,6 +279,7 @@ def main():
         },
         "hybrid_data_parallel_training": verify_dual_gpu_training(),
         "autoregressive_generation_per_gpu": verify_dual_gpu_generation(),
+        "train_resume_export_generate_cli": verify_cli_training(),
     }
     output_path = Path("/kaggle/working/apex_triton_benchmark.json")
     output_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")

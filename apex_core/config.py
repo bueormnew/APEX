@@ -61,9 +61,9 @@ class APEXConfig:
         if layer_pattern is not None:
             self.layer_pattern = [p.lower() for p in layer_pattern]
         elif preset in PRESET_PATTERNS:
-            self.layer_pattern = PRESET_PATTERNS[preset]
+            self.layer_pattern = list(PRESET_PATTERNS[preset])
         else:
-            self.layer_pattern = PRESET_PATTERNS[BlockPreset.APEX_PYRAMID]
+            self.layer_pattern = list(PRESET_PATTERNS[BlockPreset.APEX_PYRAMID])
 
         # Parámetros ECHO
         self.echo_n_keys = echo_n_keys

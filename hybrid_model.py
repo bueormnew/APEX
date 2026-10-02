@@ -227,10 +227,13 @@ class HybridCausalLM(nn.Module):
                 ignore_index=-100,
             )
             loss = ce_loss + total_aux_loss
+        else:
+            ce_loss = None
 
         if return_dict:
             return {
                 "loss": loss,
+                "lm_loss": ce_loss,
                 "logits": logits,
                 "aux_loss": total_aux_loss,
             }
@@ -247,16 +250,18 @@ class HybridCausalLM(nn.Module):
                     n_heads=self.config.hop_gate_heads,
                     r_routes=self.config.hop_routes * (2 if self.config.hop_pointer_jump else 1),
                     device=device,
-                    dtype=torch.float32,
+                    dtype=self.embedding.weight.dtype,
                 )
             elif layer.block_type == "lrcm":
                 state = LRCMMemoryState(
                     batch_size=batch_size,
                     max_tokens=self.config.max_seq_len,
+                    local_window=self.config.lrcm_local_window,
                     chunk_size=self.config.lrcm_chunk_size,
                     d_model=self.config.d_model,
                     desc_dim=self.config.lrcm_desc_dim,
                     device=device,
+                    dtype=self.embedding.weight.dtype,
                 )
             elif layer.block_type == "mamba3":
                 state = Mamba3State(
@@ -266,6 +271,7 @@ class HybridCausalLM(nn.Module):
                         layer.module.headdim,
                         layer.module.d_state,
                         device=device,
+                        dtype=self.embedding.weight.dtype,
                     ),
                     bx_prev=torch.zeros(
                         batch_size,
@@ -273,12 +279,14 @@ class HybridCausalLM(nn.Module):
                         layer.module.headdim,
                         layer.module.d_state,
                         device=device,
+                        dtype=self.embedding.weight.dtype,
                     ),
                     accumulated_angle=torch.zeros(
                         batch_size,
                         layer.module.n_heads,
                         layer.module.d_state // 2,
                         device=device,
+                        dtype=self.embedding.weight.dtype,
                     ),
                 )
             states.append(state)
@@ -318,30 +326,43 @@ class HybridCausalLM(nn.Module):
         """
         Generación autoregresiva token a token.
         """
-        self.eval()
         B, T = prompt_tokens.shape
+        if T == 0:
+            raise ValueError("prompt_tokens must contain at least one token")
+        if T + max_new_tokens > self.config.max_seq_len:
+            raise ValueError(
+                f"Prompt plus generated tokens ({T + max_new_tokens}) exceeds "
+                f"max_seq_len ({self.config.max_seq_len})"
+            )
+        if max_new_tokens < 0:
+            raise ValueError("max_new_tokens must be non-negative")
+        was_training = self.training
+        self.eval()
         device = prompt_tokens.device
-        states = self.init_inference_states(batch_size=B, device=device)
+        try:
+            states = self.init_inference_states(batch_size=B, device=device)
 
-        # Prellenar estados con el prompt
-        for t in range(T - 1):
-            curr_token = prompt_tokens[:, t:t+1]
-            _, states = self.step(curr_token, states)
+            for t in range(T - 1):
+                _, states = self.step(prompt_tokens[:, t:t + 1], states)
 
-        curr_token = prompt_tokens[:, -1:]
-        generated = [prompt_tokens]
+            curr_token = prompt_tokens[:, -1:]
+            generated = [prompt_tokens]
 
-        for _ in range(max_new_tokens):
-            logits_t, states = self.step(curr_token, states) # [B, 1, vocab_size]
-            logits_t = logits_t[:, -1, :] / max(temperature, 1e-5)
+            for _ in range(max_new_tokens):
+                logits_t, states = self.step(curr_token, states)
+                logits_t = logits_t[:, -1, :]
+                if temperature <= 0:
+                    next_token = logits_t.argmax(dim=-1, keepdim=True)
+                else:
+                    logits_t = logits_t / temperature
+                    if top_k > 0:
+                        vals, _ = torch.topk(logits_t, min(top_k, logits_t.shape[-1]))
+                        logits_t = logits_t.masked_fill(logits_t < vals[:, -1, None], -float("Inf"))
+                    probs = F.softmax(logits_t, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
+                generated.append(next_token)
+                curr_token = next_token
 
-            if top_k > 0:
-                vals, _ = torch.topk(logits_t, min(top_k, logits_t.shape[-1]))
-                logits_t[logits_t < vals[:, -1, None]] = -float("Inf")
-
-            probs = F.softmax(logits_t, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1) # [B, 1]
-            generated.append(next_token)
-            curr_token = next_token
-
-        return torch.cat(generated, dim=1)
+            return torch.cat(generated, dim=1)
+        finally:
+            self.train(was_training)

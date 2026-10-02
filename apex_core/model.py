@@ -11,6 +11,7 @@ import os
 import io
 import json
 import zipfile
+import tempfile
 from typing import Optional, Dict, Any, List, Union, Tuple
 import torch
 import torch.nn as nn
@@ -100,8 +101,11 @@ class APEXModel(nn.Module):
         - `weights.pt`: Tensores de pesos y sesgos de la red.
         - `metadata.json`: Metadatos del framework, versión y arquitectura.
         """
+        file_path = os.fspath(file_path)
         if not file_path.endswith(".apex"):
             file_path += ".apex"
+        directory = os.path.dirname(os.path.abspath(file_path))
+        os.makedirs(directory, exist_ok=True)
 
         config_dict = self.config.to_dict()
         metadata = {
@@ -112,16 +116,19 @@ class APEXModel(nn.Module):
             "architecture": self.config.layer_pattern,
         }
 
-        # Serializar tensores a bytes en memoria
         weights_buffer = io.BytesIO()
         torch.save(self.state_dict(), weights_buffer)
-        weights_bytes = weights_buffer.getvalue()
-
-        # Empaquetar todo en el archivo .apex
-        with zipfile.ZipFile(file_path, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
-            zip_file.writestr("config.json", json.dumps(config_dict, indent=2))
-            zip_file.writestr("metadata.json", json.dumps(metadata, indent=2))
-            zip_file.writestr("weights.pt", weights_bytes)
+        fd, temporary = tempfile.mkstemp(prefix=".apex-model-", suffix=".apex", dir=directory)
+        os.close(fd)
+        try:
+            with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
+                zip_file.writestr("config.json", json.dumps(config_dict, indent=2))
+                zip_file.writestr("metadata.json", json.dumps(metadata, indent=2))
+                zip_file.writestr("weights.pt", weights_buffer.getvalue())
+            os.replace(temporary, file_path)
+        finally:
+            if os.path.exists(temporary):
+                os.remove(temporary)
 
         return file_path
 
@@ -131,6 +138,7 @@ class APEXModel(nn.Module):
         Carga un modelo completo desde un archivo `.apex`.
         Restaura instantáneamente la configuración y los pesos exactos.
         """
+        file_path = os.fspath(file_path)
         if not os.path.exists(file_path):
             if os.path.exists(file_path + ".apex"):
                 file_path = file_path + ".apex"
@@ -146,7 +154,7 @@ class APEXModel(nn.Module):
         model = cls(config)
 
         weights_buffer = io.BytesIO(weights_bytes)
-        state_dict = torch.load(weights_buffer, map_location=device)
+        state_dict = torch.load(weights_buffer, map_location=device, weights_only=True)
         model.load_state_dict(state_dict)
         model.to(device)
         return model
