@@ -22,7 +22,7 @@
 - **Formato Unificado `.apex`**: Exportación e importación en un único archivo comprimido autocontenido que preserva pesos, configuración exacta y metadatos sin dispersión de archivos.
 - **Entrenador Multitécnica (`APEXTrainer`)**: AdamW acoplado, Cosine Annealing con Warmup, Gradient Clipping por norma L2, pérdida auxiliar balanceada de ECHO y modos de fine-tuning selectivo (`echo_only`, `mamba_only`, `backbone`).
 - **Suite de Métricas y Benchmarks**: Monitoreo de throughput (tokens/s), latencia por token (ms/token), uso de memoria y arnés de evaluación para pares de preguntas/respuestas (QA) y pruebas sintéticas de aguja en el pajar (*Needle-in-a-Haystack*).
-- **Especificación de Kernels Fused en Triton**: Plan de aceleración en hardware para forward/backward por chunks y decodificación persistente token a token.
+- **Kernels Triton opcionales**: Scan recurrente Mamba-3 con backward explícito y actualización recurrente fused para decode de un token.
 
 ---
 
@@ -151,9 +151,19 @@ print(f"Precisión QA: {results['accuracy_percent']:.1f}%")
 
 ## 🔬 Aceleración por Hardware (Kernels Triton)
 
-Para llevar APEX a escala masiva en centros de datos con NVIDIA H100 / B200, consulta la especificación técnica completa en [`TRITON_KERNELS_APEX.md`](TRITON_KERNELS_APEX.md):
-- **Kernel de Entrenamiento**: Fusión de discretización trapezoidal 2º orden + RoPE complejo + scan asociativo por chunks con recomputación en registros/SRAM (reducción del 80% en uso de VRAM).
-- **Kernel de Inferencia**: Decodificación persistente de 1 solo token fusionando convolución causal, actualización recurrente y lookup de ECHO en registros (reducción del 89% en latencia por llamadas CUDA).
+Los kernels Triton opcionales aceleran **el núcleo recurrente de Mamba-3**, no la arquitectura híbrida completa:
+- **Entrenamiento**: scan recurrente causal con backward Triton explícito. El backward guarda los estados por paso; no implementa todavía recomputación por chunks ni promete ahorros de VRAM.
+- **Inferencia**: un paso de decode fusiona actualización del estado y lectura recurrente por lote/cabeza. Las proyecciones Mamba-3, Hop-Mix, LRCM y ECHO siguen ejecutándose en PyTorch.
+- **Fallback**: sin Triton o CUDA, Mamba-3 usa su ruta PyTorch.
+
+Instala el extra CUDA en Linux con `pip install -e ".[cuda]"`. Para ejecutar las pruebas y medir los kernels en una máquina Kaggle con dos T4:
+
+```bash
+kaggle kernels push -p kaggle --accelerator NvidiaTeslaT4
+kaggle kernels status gersonbuenahora/apex-two-t4-triton-benchmarks
+```
+
+El notebook exige dos T4, comprueba salidas y gradientes contra PyTorch, entrena el modelo híbrido con DataParallel en ambas GPU, y prueba generación en cada GPU. Las métricas se miden en el runtime y dependen de sus formas de tensores; no se asume una aceleración por adelantado. Consulta [`TRITON_KERNELS_APEX.md`](TRITON_KERNELS_APEX.md) para detalles y limitaciones.
 
 ---
 
@@ -171,8 +181,11 @@ APEX/
 ├── hopmix.py                      # Bloque Hop-Mix
 ├── lrcm.py                        # Bloque LRCM
 ├── mamba3.py                      # Bloque Mamba-3 puro
+├── apex_triton.py                 # Kernels Triton Mamba-3 opcionales
 ├── hybrid_model.py                # Ensamblado del modelo causal híbrido
 ├── test_apex_library.py           # Suite integral de verificación
+├── tests/test_triton_kernels.py   # Pruebas CUDA de salida, gradientes y decode
+├── kaggle/                        # Notebook de validación con dos T4
 ├── setup.py                       # Empaquetado pip
 ├── TRITON_KERNELS_APEX.md         # Documento detallado de Kernels en Triton
 └── README.md                      # Documentación principal

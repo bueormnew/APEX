@@ -34,6 +34,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from echo import RMSNorm
+from apex_triton import TRITON_AVAILABLE, mamba3_decode_step, mamba3_scan
 
 
 def apply_rotary_emb(x: torch.Tensor, angles: torch.Tensor) -> torch.Tensor:
@@ -188,48 +189,48 @@ class Mamba3(nn.Module):
         # dA: [B, T, n_heads]
         dA = torch.exp(dt * A.view(1, 1, self.n_heads)) # [B, T, n_heads]
 
-        # 5. Escaneo Recurrente Causal Puro con MIMO y Trapecio
+        if self.training and x.is_cuda and TRITON_AVAILABLE:
+            scan_u = u.sum(dim=-1) if self.is_mimo else u.squeeze(-1)
+            scan_y = mamba3_scan(
+                scan_u.contiguous(),
+                B_rot.contiguous(),
+                C_rot.contiguous(),
+                dt.contiguous(),
+                trap_gate.contiguous(),
+                A.contiguous(),
+            )
+            y = scan_y.view(B, T, self.d_inner)
+            h = bx_prev = None
+        else:
+            # 5. Escaneo Recurrente Causal Puro con MIMO y Trapecio
         # Estado h: [B, n_heads, headdim, d_state]
-        h = torch.zeros(B, self.n_heads, self.headdim, self.d_state, device=x.device, dtype=x.dtype)
+            h = torch.zeros(B, self.n_heads, self.headdim, self.d_state, device=x.device, dtype=x.dtype)
         # bx_prev para regla trapezoidal de segundo orden: [B, n_heads, headdim, d_state]
-        bx_prev = torch.zeros_like(h)
+            bx_prev = torch.zeros_like(h)
 
-        y_steps = []
-        for t in range(T):
+            y_steps = []
+            for t in range(T):
             # u_t: [B, n_heads, headdim, R]
-            u_t = u[:, t]
-            B_t = B_rot[:, t] # [B, n_heads, d_state]
-            C_t = C_rot[:, t] # [B, n_heads, d_state]
-            dt_t = dt[:, t].unsqueeze(-1).unsqueeze(-1) # [B, n_heads, 1, 1]
-            dA_t = dA[:, t].unsqueeze(-1).unsqueeze(-1) # [B, n_heads, 1, 1]
-            trap_t = trap_gate[:, t].unsqueeze(-1).unsqueeze(-1) # [B, n_heads, 1, 1]
+                u_t = u[:, t]
+                B_t = B_rot[:, t] # [B, n_heads, d_state]
+                C_t = C_rot[:, t] # [B, n_heads, d_state]
+                dt_t = dt[:, t].unsqueeze(-1).unsqueeze(-1) # [B, n_heads, 1, 1]
+                dA_t = dA[:, t].unsqueeze(-1).unsqueeze(-1) # [B, n_heads, 1, 1]
+                trap_t = trap_gate[:, t].unsqueeze(-1).unsqueeze(-1) # [B, n_heads, 1, 1]
 
-            # MIMO rank-R outer product:
-            # En SISO: bx = u * B. En MIMO: contracción u_t (headdim, R) con B_t (d_state, R) o suma sobre R
-            # Para MIMO puro de rango R, sumamos la interacción sobre los R flujos de entrada:
-            # bx_current: [B, n_heads, headdim, d_state]
-            if self.is_mimo:
-                # B_t: [B, n_heads, d_state]
-                # u_t: [B, n_heads, headdim, R] -> sumamos sobre R
-                u_sum = u_t.sum(dim=-1) # [B, n_heads, headdim]
-                bx_curr = torch.einsum("bnh,bnd->bnhd", u_sum, B_t)
-            else:
-                bx_curr = torch.einsum("bnh,bnd->bnhd", u_t.squeeze(-1), B_t)
+                if self.is_mimo:
+                    u_sum = u_t.sum(dim=-1)
+                    bx_curr = torch.einsum("bnh,bnd->bnhd", u_sum, B_t)
+                else:
+                    bx_curr = torch.einsum("bnh,bnd->bnhd", u_t.squeeze(-1), B_t)
 
-            # Regla trapezoidal exponencial:
-            # u_eff = (1 - 0.5 * trap) * bx_curr + (0.5 * trap) * bx_prev
-            u_eff = (1.0 - 0.5 * trap_t) * bx_curr + (0.5 * trap_t) * bx_prev
-            bx_prev = bx_curr
-
-            # Actualización del estado: h = dA * h + dt * u_eff
-            h = dA_t * h + dt_t * u_eff
-
-            # Lectura del estado: y_t = h @ C_t -> [B, n_heads, headdim]
-            y_t = torch.einsum("bnhd,bnd->bnh", h, C_t)
-            y_steps.append(y_t)
+                u_eff = (1.0 - 0.5 * trap_t) * bx_curr + (0.5 * trap_t) * bx_prev
+                bx_prev = bx_curr
+                h = dA_t * h + dt_t * u_eff
+                y_steps.append(torch.einsum("bnhd,bnd->bnh", h, C_t))
 
         # Concatenar secuencia temporal: [B, T, n_heads, headdim]
-        y = torch.stack(y_steps, dim=1).view(B, T, self.d_inner)
+            y = torch.stack(y_steps, dim=1).view(B, T, self.d_inner)
 
         # Compuerta SiLU multiplicativa con z
         y_gated = y * F.silu(z)
@@ -239,7 +240,7 @@ class Mamba3(nn.Module):
 
         # Actualizar estado si fue solicitado
         new_state = None
-        if state is not None or not self.training:
+        if (state is not None or not self.training) and h is not None:
             new_state = Mamba3State(
                 ssm_state=h,
                 bx_prev=bx_prev,
@@ -284,18 +285,27 @@ class Mamba3(nn.Module):
         dA_t = dA.unsqueeze(-1).unsqueeze(-1)
         trap_t = trap_gate.unsqueeze(-1).unsqueeze(-1)
 
-        if self.is_mimo:
-            u_sum = u.sum(dim=-1)
-            bx_curr = torch.einsum("bnh,bnd->bnhd", u_sum, B_rot)
+        scan_u = u.sum(dim=-1) if self.is_mimo else u.squeeze(-1)
+        y = mamba3_decode_step(
+            scan_u.contiguous(),
+            B_rot.contiguous(),
+            C_rot.contiguous(),
+            dt.contiguous(),
+            trap_gate.contiguous(),
+            A.contiguous(),
+            state.ssm_state,
+            state.bx_prev,
+        )
+        if y is not None:
+            new_h = state.ssm_state
+            new_bx_prev = state.bx_prev
+            y = y.view(B, self.d_inner)
         else:
-            bx_curr = torch.einsum("bnh,bnd->bnhd", u.squeeze(-1), B_rot)
-
-        # Regla trapezoidal con bx_prev de la memoria
-        u_eff = (1.0 - 0.5 * trap_t) * bx_curr + (0.5 * trap_t) * state.bx_prev
-        new_bx_prev = bx_curr
-
-        new_h = dA_t * state.ssm_state + dt_t * u_eff
-        y = torch.einsum("bnhd,bnd->bnh", new_h, C_rot).view(B, self.d_inner)
+            bx_curr = torch.einsum("bnh,bnd->bnhd", scan_u, B_rot)
+            u_eff = (1.0 - 0.5 * trap_t) * bx_curr + (0.5 * trap_t) * state.bx_prev
+            new_bx_prev = bx_curr
+            new_h = dA_t * state.ssm_state + dt_t * u_eff
+            y = torch.einsum("bnhd,bnd->bnh", new_h, C_rot).view(B, self.d_inner)
 
         y_gated = y * F.silu(z)
         out_t = x_t + self.out_proj(y_gated.unsqueeze(1))
