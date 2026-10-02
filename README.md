@@ -60,6 +60,10 @@ apex generate --model ./runs/mi_apex/latest.apex --prompt "Érase una vez" --max
 
 Para un smoke test corto, prueba `--layers hopmix,lrcm,mamba3 --d-model 64 --head-dim 16 --state-size 16 --steps 5`; para arquitectura y capacidad de producción, configura el preset y escala la secuencia, los datos y los pasos de acuerdo con las GPU. El entrenamiento multi-GPU de este CLI replica el modelo con `DataParallel`; el batch debe ser al menos igual al número de GPU.
 
+### Alcance actual y límites para producción
+
+El CLI y el formato `.apex` permiten entrenar, reanudar y generar, pero no incluyen pesos preentrenados ni garantizan calidad lingüística: la verificación Kaggle usa un corpus pequeño y solo valida que el recorrido técnico funcione. El tokenizer incluido codifica bytes UTF-8, no subpalabras. En la arquitectura integrada, Hop-Mix usa sus saltos geométricos; el enrutamiento guiado acepta rutas explícitas, pero el modelo causal aún no las predice automáticamente. LRCM recupera chunks completos anteriores; aunque calcula descriptores de página y región, todavía no usa esos niveles para routing jerárquico. La opción Mamba-3 MIMO proyecta varios componentes de entrada y los suma antes del scan; no debe interpretarse como una implementación validada de toda formulación MIMO del artículo. Por estas razones APEX es un baseline de investigación ejecutable, no una arquitectura certificada ni un modelo listo para servir en producción sin evaluación, escalado y validación de calidad propios.
+
 ---
 
 ## 🛠️ Guía Rápida de Uso

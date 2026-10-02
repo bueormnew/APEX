@@ -2,8 +2,8 @@
   "run": {
     "date_utc": "2026-10-02",
     "kaggle_kernel": "https://www.kaggle.com/code/gersonbuenahora/apex-two-t4-triton-benchmarks",
-    "kaggle_version": 4,
-    "repository_commit": "9bb27f0",
+    "kaggle_version": 7,
+    "repository_commit": "1568442",
     "gpus": [
       "Tesla T4",
       "Tesla T4"
@@ -19,22 +19,22 @@
       32,
       32
     ],
-    "torch_forward_backward_ms": 92.34,
-    "triton_forward_backward_ms": 0.964,
-    "speedup": 95.746
+    "torch_forward_backward_ms": 103.864,
+    "triton_forward_backward_ms": 1.052,
+    "speedup": 98.731
   },
   "decode_step_per_gpu": {
     "0": {
       "batch": 16,
-      "torch_step_ms": 0.2386,
-      "triton_step_ms": 0.0689,
-      "speedup": 3.461
+      "torch_step_ms": 0.2509,
+      "triton_step_ms": 0.0704,
+      "speedup": 3.565
     },
     "1": {
       "batch": 16,
-      "torch_step_ms": 0.246,
-      "triton_step_ms": 0.0632,
-      "speedup": 3.893
+      "torch_step_ms": 0.2642,
+      "triton_step_ms": 0.0732,
+      "speedup": 3.609
     }
   },
   "hybrid_data_parallel_training": {
@@ -51,7 +51,7 @@
       32,
       128
     ],
-    "loss": 31.322165,
+    "loss": 31.260883,
     "gpu0_reserved_mb": 80.0,
     "gpu1_reserved_mb": 26.0
   },
@@ -70,5 +70,13 @@
         7
       ]
     }
-  ]
+  ],
+  "train_resume_export_generate_cli": {
+    "completed_training_steps": 2,
+    "validation_loss": 29.63755,
+    "model_exported": true,
+    "resume_checkpoint_exported": true,
+    "generation_command_succeeded": true,
+    "training_output_contains_two_t4_data_parallel": true
+  }
 }
