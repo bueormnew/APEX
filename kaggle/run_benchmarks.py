@@ -2,11 +2,14 @@
 
 import json
 import statistics
+import sys
 import time
 from pathlib import Path
 
 import torch
 import torch.nn as nn
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from apex_triton import mamba3_decode_step, mamba3_scan
 from hybrid_model import HybridCausalLM, HybridLMConfig
